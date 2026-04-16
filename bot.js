@@ -162,7 +162,7 @@ function addOpenPosition(trade) {
   return id;
 }
 
-function closePosition(exitPrice, exitReason, mode) {
+async function closePosition(exitPrice, exitReason, mode) {
   const positions = loadPositions();
   const idx = positions.findIndex((p) => p.result === "OPEN");
   if (idx === -1) return null;
@@ -187,6 +187,7 @@ function closePosition(exitPrice, exitReason, mode) {
 
   savePositions(positions);
   rebuildPerformance(positions);
+  await maybeSendReportCard(positions);
   return positions[idx];
 }
 
@@ -262,6 +263,50 @@ function rebuildPerformance(positions) {
   writeFileSync(PERF_FILE, JSON.stringify(perf, null, 2));
   console.log(`📊 Performance updated → ${PERF_FILE} | ${perf.verdict} | WR: ${perf.winRate}% | P&L: $${perf.totalPnlUSD}`);
   return perf;
+}
+
+// ─── Bot Report Card (every 10 closed trades) ────────────────────────────────
+
+async function maybeSendReportCard(positions) {
+  const closed = positions.filter((p) => p.result !== "OPEN");
+  if (closed.length === 0 || closed.length % 10 !== 0) return;
+
+  let perf;
+  try { perf = JSON.parse(readFileSync(PERF_FILE, "utf8")); } catch { return; }
+
+  const wins   = closed.filter((p) => p.result === "WIN");
+  const losses = closed.filter((p) => p.result === "LOSS");
+
+  // Last 10 trades
+  const last10 = closed.slice(-10);
+  const last10W = last10.filter((p) => p.result === "WIN").length;
+  const last10Pnl = last10.reduce((s, p) => s + p.pnlUSD, 0);
+
+  // Auto-recommendations
+  const tips = [];
+  if (perf.winRate < 40) tips.push("• Win rate below 40% — consider tightening entry conditions (stricter RSI threshold)");
+  if (perf.avgWinUSD < perf.avgLossUSD) tips.push("• Avg win < avg loss — consider widening TP or tightening SL");
+  if (perf.maxConsecLoss >= 4) tips.push(`• ${perf.maxConsecLoss} consecutive losses recorded — check if VWAP reset is causing bad entries`);
+  if (perf.profitFactor !== "∞" && perf.profitFactor < 1) tips.push("• Profit factor < 1 — strategy is net losing, review all entry conditions");
+  if (last10W >= 8) tips.push("• Last 10 trades: hot streak — strategy is firing well");
+  if (last10W <= 2) tips.push("• Last 10 trades: cold streak — market conditions may not suit this setup");
+  if (tips.length === 0) tips.push("• Looking solid — keep monitoring");
+
+  const msg =
+    `📋 <b>3m Bot — Report Card #${closed.length / 10}</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `Trades: ${closed.length} | ${perf.wins}W / ${perf.losses}L\n` +
+    `Win Rate: ${perf.winRate}%\n` +
+    `Total P&L: ${perf.totalPnlUSD >= 0 ? "+" : ""}$${perf.totalPnlUSD.toFixed(3)}\n` +
+    `Avg Win: +$${perf.avgWinUSD.toFixed(4)} | Avg Loss: -$${perf.avgLossUSD.toFixed(4)}\n` +
+    `Profit Factor: ${perf.profitFactor}\n` +
+    `Max Drawdown: -$${perf.maxDrawdownUSD.toFixed(3)}\n` +
+    `Last 10: ${last10W}W/${10 - last10W}L | P&L ${last10Pnl >= 0 ? "+" : ""}$${last10Pnl.toFixed(3)}\n` +
+    `Verdict: ${perf.verdict}\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `💡 <b>Suggestions:</b>\n${tips.join("\n")}`;
+
+  await sendTelegram(msg);
 }
 
 // ─── Logging ────────────────────────────────────────────────────────────────
