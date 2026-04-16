@@ -3,7 +3,7 @@
  *
  * Cloud mode: runs on Railway on a schedule. Pulls candle data direct from
  * Binance (free, no auth), calculates all indicators, runs safety check,
- * executes via BitGet if everything lines up.
+ * executes via Binance Spot API if everything lines up.
  *
  * Local mode: run manually — node bot.js
  * Cloud mode: deploy to Railway, set env vars, Railway triggers on cron schedule
@@ -17,20 +17,21 @@ import { execSync } from "child_process";
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
 function checkOnboarding() {
-  const required = ["BITGET_API_KEY", "BITGET_SECRET_KEY", "BITGET_PASSPHRASE"];
+  const required = ["BINANCE_API_KEY", "BINANCE_SECRET_KEY"];
   const missing = required.filter((k) => !process.env[k]);
 
-  if (!existsSync(".env")) {
+  // In cloud (Railway), env vars are injected directly — no .env file needed
+  const hasEnvVars = required.every((k) => process.env[k]);
+  if (!hasEnvVars && !existsSync(".env")) {
     console.log(
       "\n⚠️  No .env file found — opening it for you to fill in...\n",
     );
     writeFileSync(
       ".env",
       [
-        "# BitGet credentials",
-        "BITGET_API_KEY=",
-        "BITGET_SECRET_KEY=",
-        "BITGET_PASSPHRASE=",
+        "# Binance credentials",
+        "BINANCE_API_KEY=",
+        "BINANCE_SECRET_KEY=",
         "",
         "# Trading config",
         "PORTFOLIO_VALUE_USD=1000",
@@ -45,7 +46,7 @@ function checkOnboarding() {
       execSync("open .env");
     } catch {}
     console.log(
-      "Fill in your BitGet credentials in .env then re-run: node bot.js\n",
+      "Fill in your Binance credentials in .env then re-run: node bot.js\n",
     );
     process.exit(0);
   }
@@ -79,15 +80,184 @@ const CONFIG = {
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
   paperTrading: process.env.PAPER_TRADING !== "false",
   tradeMode: process.env.TRADE_MODE || "spot",
-  bitget: {
-    apiKey: process.env.BITGET_API_KEY,
-    secretKey: process.env.BITGET_SECRET_KEY,
-    passphrase: process.env.BITGET_PASSPHRASE,
-    baseUrl: process.env.BITGET_BASE_URL || "https://api.bitget.com",
+  binance: {
+    apiKey: process.env.BINANCE_API_KEY,
+    secretKey: process.env.BINANCE_SECRET_KEY,
+    baseUrl: "https://api.binance.com",
   },
 };
 
-const LOG_FILE = "safety-check-log.json";
+// /data is a Railway persistent volume — survives container restarts
+// Falls back to local directory when running on your machine
+const DATA_DIR = existsSync("/data") ? "/data" : ".";
+const LOG_FILE       = `${DATA_DIR}/safety-check-log.json`;
+const POSITIONS_FILE = `${DATA_DIR}/positions.json`;
+const POSITIONS_CSV  = `${DATA_DIR}/positions.csv`;
+const PERF_FILE      = `${DATA_DIR}/performance.json`;
+
+const POSITIONS_CSV_HEADERS =
+  "Trade ID,Symbol,Direction,Entry Time,Entry Price,TP,SL,Size USD," +
+  "Close Time,Exit Price,P&L USD,P&L %,Result,Exit Reason,Mode";
+
+// ─── Positions & Performance ─────────────────────────────────────────────────
+
+function loadPositions() {
+  if (!existsSync(POSITIONS_FILE)) return [];
+  return JSON.parse(readFileSync(POSITIONS_FILE, "utf8"));
+}
+
+function savePositions(positions) {
+  writeFileSync(POSITIONS_FILE, JSON.stringify(positions, null, 2));
+
+  // Rebuild the CSV from scratch every time
+  const rows = positions.map((p) =>
+    [
+      p.id,
+      p.symbol,
+      p.direction,
+      p.entryTime,
+      p.entryPrice,
+      p.tp,
+      p.sl,
+      p.sizeUSD,
+      p.closeTime  ?? "",
+      p.exitPrice  ?? "",
+      p.pnlUSD     != null ? p.pnlUSD.toFixed(4)  : "",
+      p.pnlPct     != null ? p.pnlPct.toFixed(4)   : "",
+      p.result     ?? "OPEN",
+      p.exitReason ?? "",
+      p.mode,
+    ].join(",")
+  );
+  writeFileSync(POSITIONS_CSV, POSITIONS_CSV_HEADERS + "\n" + rows.join("\n") + "\n");
+}
+
+function addOpenPosition(trade) {
+  const positions = loadPositions();
+  const id = `T${String(positions.length + 1).padStart(4, "0")}`;
+  positions.push({
+    id,
+    symbol:     trade.symbol,
+    direction:  trade.direction,
+    entryTime:  trade.entryTime,
+    entryPrice: trade.entryPrice,
+    tp:         trade.tp,
+    sl:         trade.sl,
+    sizeUSD:    trade.sizeUSD,
+    closeTime:  null,
+    exitPrice:  null,
+    pnlUSD:     null,
+    pnlPct:     null,
+    result:     "OPEN",
+    exitReason: null,
+    mode:       trade.mode,
+    orderId:    trade.orderId,
+  });
+  savePositions(positions);
+  return id;
+}
+
+function closePosition(exitPrice, exitReason, mode) {
+  const positions = loadPositions();
+  const idx = positions.findIndex((p) => p.result === "OPEN");
+  if (idx === -1) return null;
+
+  const pos = positions[idx];
+  const pnlUSD = pos.direction === "BUY"
+    ? (exitPrice - pos.entryPrice) / pos.entryPrice * pos.sizeUSD
+    : (pos.entryPrice - exitPrice) / pos.entryPrice * pos.sizeUSD;
+  const pnlPct = pos.direction === "BUY"
+    ? (exitPrice - pos.entryPrice) / pos.entryPrice * 100
+    : (pos.entryPrice - exitPrice) / pos.entryPrice * 100;
+
+  positions[idx] = {
+    ...pos,
+    closeTime:  new Date().toISOString(),
+    exitPrice,
+    pnlUSD,
+    pnlPct,
+    result:     pnlUSD >= 0 ? "WIN" : "LOSS",
+    exitReason,
+  };
+
+  savePositions(positions);
+  rebuildPerformance(positions);
+  return positions[idx];
+}
+
+function rebuildPerformance(positions) {
+  const closed = positions.filter((p) => p.result !== "OPEN");
+  if (closed.length === 0) {
+    writeFileSync(PERF_FILE, JSON.stringify({
+      verdict: "INSUFFICIENT DATA — no closed trades yet",
+      closedTrades: 0,
+      lastUpdated: new Date().toISOString(),
+    }, null, 2));
+    return;
+  }
+
+  const wins   = closed.filter((p) => p.result === "WIN");
+  const losses = closed.filter((p) => p.result === "LOSS");
+  const totalPnl    = closed.reduce((s, p) => s + p.pnlUSD, 0);
+  const grossProfit = wins.reduce((s, p) => s + p.pnlUSD, 0);
+  const grossLoss   = Math.abs(losses.reduce((s, p) => s + p.pnlUSD, 0));
+  const profitFactor = grossLoss === 0 ? Infinity : grossProfit / grossLoss;
+  const avgWin   = wins.length   ? grossProfit / wins.length   : 0;
+  const avgLoss  = losses.length ? grossLoss   / losses.length : 0;
+  const winRate  = (wins.length / closed.length) * 100;
+
+  // Max drawdown — largest peak-to-trough in cumulative P&L
+  let peak = 0, cumPnl = 0, maxDD = 0;
+  for (const p of closed) {
+    cumPnl += p.pnlUSD;
+    if (cumPnl > peak) peak = cumPnl;
+    const dd = peak - cumPnl;
+    if (dd > maxDD) maxDD = dd;
+  }
+
+  // Consecutive wins/losses
+  let maxConsecWins = 0, maxConsecLoss = 0, curW = 0, curL = 0;
+  for (const p of closed) {
+    if (p.result === "WIN") { curW++; curL = 0; maxConsecWins = Math.max(maxConsecWins, curW); }
+    else                    { curL++; curW = 0; maxConsecLoss = Math.max(maxConsecLoss, curL); }
+  }
+
+  const best  = closed.reduce((a, b) => b.pnlUSD > a.pnlUSD ? b : a);
+  const worst = closed.reduce((a, b) => b.pnlUSD < a.pnlUSD ? b : a);
+
+  const perf = {
+    strategy:          "VWAP + RSI(3) + EMA(8) Scalping",
+    symbol:            CONFIG.symbol,
+    timeframe:         CONFIG.timeframe,
+    mode:              CONFIG.paperTrading ? "PAPER" : "LIVE",
+    closedTrades:      closed.length,
+    openTrades:        positions.filter((p) => p.result === "OPEN").length,
+    wins:              wins.length,
+    losses:            losses.length,
+    winRate:           parseFloat(winRate.toFixed(2)),
+    totalPnlUSD:       parseFloat(totalPnl.toFixed(4)),
+    grossProfit:       parseFloat(grossProfit.toFixed(4)),
+    grossLoss:         parseFloat(grossLoss.toFixed(4)),
+    profitFactor:      profitFactor === Infinity ? "∞" : parseFloat(profitFactor.toFixed(3)),
+    avgWinUSD:         parseFloat(avgWin.toFixed(4)),
+    avgLossUSD:        parseFloat(avgLoss.toFixed(4)),
+    maxDrawdownUSD:    parseFloat(maxDD.toFixed(4)),
+    bestTradeUSD:      parseFloat(best.pnlUSD.toFixed(4)),
+    worstTradeUSD:     parseFloat(worst.pnlUSD.toFixed(4)),
+    maxConsecWins,
+    maxConsecLoss,
+    verdict: totalPnl > 0 && profitFactor > 1
+      ? "✅ PROFITABLE"
+      : totalPnl < 0
+        ? "❌ UNPROFITABLE"
+        : "⚠️  BREAK EVEN",
+    lastUpdated: new Date().toISOString(),
+  };
+
+  writeFileSync(PERF_FILE, JSON.stringify(perf, null, 2));
+  console.log(`📊 Performance updated → ${PERF_FILE} | ${perf.verdict} | WR: ${perf.winRate}% | P&L: $${perf.totalPnlUSD}`);
+  return perf;
+}
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 
@@ -124,7 +294,9 @@ async function fetchCandles(symbol, interval, limit = 100) {
   };
   const binanceInterval = intervalMap[interval] || "1m";
 
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
+  // data-api.binance.vision is Binance's global CDN mirror — same data,
+  // no geo-blocking (accessible from US-based servers like Railway)
+  const url = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
   const data = await res.json();
@@ -194,9 +366,9 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
 
   console.log("\n── Safety Check ─────────────────────────────────────────\n");
 
-  // Determine bias first
-  const bullishBias = price > vwap && price > ema8;
-  const bearishBias = price < vwap && price < ema8;
+  // Determine bias using VWAP only — price above VWAP = bullish, below = bearish
+  const bullishBias = price > vwap;
+  const bearishBias = price < vwap;
 
   if (bullishBias) {
     console.log("  Bias: BULLISH — checking long entry conditions\n");
@@ -315,61 +487,175 @@ function checkTradeLimits(log) {
   return true;
 }
 
-// ─── BitGet Execution ────────────────────────────────────────────────────────
+// ─── Binance Execution ───────────────────────────────────────────────────────
 
-function signBitGet(timestamp, method, path, body = "") {
-  const message = `${timestamp}${method}${path}${body}`;
+function signBinance(params) {
+  const queryString = new URLSearchParams(params).toString();
   return crypto
-    .createHmac("sha256", CONFIG.bitget.secretKey)
-    .update(message)
-    .digest("base64");
+    .createHmac("sha256", CONFIG.binance.secretKey)
+    .update(queryString)
+    .digest("hex");
 }
 
-async function placeBitGetOrder(symbol, side, sizeUSD, price) {
-  const quantity = (sizeUSD / price).toFixed(6);
-  const timestamp = Date.now().toString();
-  const path =
-    CONFIG.tradeMode === "spot"
-      ? "/api/v2/spot/trade/placeOrder"
-      : "/api/v2/mix/order/placeOrder";
-
-  const body = JSON.stringify({
-    symbol,
-    side,
-    orderType: "market",
-    quantity,
-    ...(CONFIG.tradeMode === "futures" && {
-      productType: "USDT-FUTURES",
-      marginMode: "isolated",
-      marginCoin: "USDT",
-    }),
-  });
-
-  const signature = signBitGet(timestamp, "POST", path, body);
-
-  const res = await fetch(`${CONFIG.bitget.baseUrl}${path}`, {
+async function binanceRequest(path, params) {
+  const timestamp = Date.now();
+  const allParams = { ...params, timestamp };
+  const signature = signBinance(allParams);
+  const queryString = new URLSearchParams({ ...allParams, signature }).toString();
+  const res = await fetch(`${CONFIG.binance.baseUrl}${path}?${queryString}`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "ACCESS-KEY": CONFIG.bitget.apiKey,
-      "ACCESS-SIGN": signature,
-      "ACCESS-TIMESTAMP": timestamp,
-      "ACCESS-PASSPHRASE": CONFIG.bitget.passphrase,
-    },
-    body,
+    headers: { "X-MBX-APIKEY": CONFIG.binance.apiKey },
   });
-
   const data = await res.json();
-  if (data.code !== "00000") {
-    throw new Error(`BitGet order failed: ${data.msg}`);
-  }
+  if (data.code) throw new Error(`Binance error: ${data.msg} (code: ${data.code})`);
+  return data;
+}
 
-  return data.data;
+async function placeOrder(symbol, side, sizeUSD, price) {
+  // MARGIN cross — borrows automatically, works for both longs and shorts
+  // BUY  (long entry / short close) : quoteOrderQty = spend X USDT
+  // SELL (short entry / long close) : quantity      = sell X coins
+  const qty = (sizeUSD / price).toFixed(6);
+  const data = await binanceRequest("/sapi/v1/margin/order", {
+    symbol,
+    isIsolated: "FALSE",          // cross margin
+    side:       side.toUpperCase(),
+    type:       "MARKET",
+    sideEffectType: "MARGIN_BUY", // auto-borrow if needed
+    ...(side.toUpperCase() === "BUY"
+      ? { quoteOrderQty: sizeUSD.toFixed(2) }
+      : { quantity: qty }),
+  });
+  return { orderId: data.orderId, price: parseFloat(data.fills?.[0]?.price || price) };
+}
+
+async function closeOrder(symbol, side, sizeUSD, price) {
+  // Closing side is opposite of entry — AUTO_REPAY pays back the loan
+  const closeSide = side.toUpperCase() === "BUY" ? "SELL" : "BUY";
+  const qty = (sizeUSD / price).toFixed(6);
+  const data = await binanceRequest("/sapi/v1/margin/order", {
+    symbol,
+    isIsolated:     "FALSE",
+    side:           closeSide,
+    type:           "MARKET",
+    sideEffectType: "AUTO_REPAY", // repay borrowed funds on close
+    ...(closeSide === "BUY"
+      ? { quoteOrderQty: sizeUSD.toFixed(2) }
+      : { quantity: qty }),
+  });
+  return { orderId: data.orderId, price: parseFloat(data.fills?.[0]?.price || price) };
+}
+
+// ─── TP / SL Calculation (van de Poppe 2:1 RR, 0.3% SL from rules.json) ──────
+
+function calcTPSL(entryPrice, direction) {
+  const SL_PCT = 0.003; // 0.3% hard stop — from rules.json
+  const TP_PCT = 0.006; // 0.6% take profit — 2:1 RR (van de Poppe minimum)
+  if (direction === "BUY") {
+    return {
+      tp: parseFloat((entryPrice * (1 + TP_PCT)).toFixed(4)),
+      sl: parseFloat((entryPrice * (1 - SL_PCT)).toFixed(4)),
+    };
+  } else {
+    return {
+      tp: parseFloat((entryPrice * (1 - TP_PCT)).toFixed(4)),
+      sl: parseFloat((entryPrice * (1 + SL_PCT)).toFixed(4)),
+    };
+  }
+}
+
+// ─── Telegram Notifications ──────────────────────────────────────────────────
+
+async function sendTelegram(message) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) {
+    console.log("Telegram: no token/chatId configured, skipping");
+    return;
+  }
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: "HTML" }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      console.log("📱 Telegram notification sent");
+    } else {
+      console.log("Telegram error:", JSON.stringify(data));
+    }
+  } catch (e) {
+    console.log("Telegram send failed (non-fatal):", e.message);
+  }
+}
+
+async function sendFile(filePath, caption) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+  if (!existsSync(filePath)) {
+    await sendTelegram(`📭 ${filePath} not found yet.`);
+    return;
+  }
+  try {
+    const form = new FormData();
+    form.append("chat_id", chatId);
+    const ext = filePath.endsWith(".csv") ? "text/csv" : "application/json";
+    const filename = filePath.split("/").pop();
+    form.append("document", new Blob([readFileSync(filePath)], { type: ext }), filename);
+    form.append("caption", caption);
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+      method: "POST",
+      body: form,
+    });
+    const data = await res.json();
+    if (data.ok) console.log(`📱 Sent ${filename} via Telegram`);
+    else console.log("Telegram sendDocument error:", JSON.stringify(data));
+  } catch (e) {
+    console.log("sendFile failed:", e.message);
+  }
+}
+
+async function sendTradesFile() {
+  const date = new Date().toISOString().slice(0, 10);
+
+  // 1. All decisions log (trades.csv)
+  await sendFile(CSV_FILE, `📋 All decisions — trades.csv (${date})`);
+
+  // 2. Executed trades only (positions.csv)
+  await sendFile(POSITIONS_CSV, `📌 Executed trades — positions.csv (${date})`);
+
+  // 3. Performance summary as a formatted message
+  if (existsSync(PERF_FILE)) {
+    const p = JSON.parse(readFileSync(PERF_FILE, "utf8"));
+    if (p.closedTrades > 0) {
+      await sendTelegram(
+        `📊 <b>Strategy Performance — ${p.symbol} ${p.timeframe}</b>\n` +
+        `─────────────────────────────\n` +
+        `Mode: ${p.mode}\n` +
+        `Closed trades: ${p.closedTrades}  |  Open: ${p.openTrades}\n` +
+        `Wins: ${p.wins}  |  Losses: ${p.losses}  |  WR: ${p.winRate}%\n` +
+        `Total P&amp;L: ${p.totalPnlUSD >= 0 ? "+" : ""}$${p.totalPnlUSD.toFixed(3)}\n` +
+        `Avg win: +$${p.avgWinUSD.toFixed(3)}  |  Avg loss: -$${p.avgLossUSD.toFixed(3)}\n` +
+        `Profit factor: ${p.profitFactor}\n` +
+        `Max drawdown: -$${p.maxDrawdownUSD.toFixed(3)}\n` +
+        `Best trade: +$${p.bestTradeUSD.toFixed(3)}  |  Worst: $${p.worstTradeUSD.toFixed(3)}\n` +
+        `Max consec. wins: ${p.maxConsecWins}  |  losses: ${p.maxConsecLoss}\n` +
+        `─────────────────────────────\n` +
+        `Verdict: ${p.verdict}`
+      );
+    } else {
+      await sendTelegram("📊 No closed trades yet — strategy verdict pending.");
+    }
+    // Also send the raw performance.json
+    await sendFile(PERF_FILE, `📊 performance.json (${date})`);
+  }
 }
 
 // ─── Tax CSV Logging ─────────────────────────────────────────────────────────
 
-const CSV_FILE = "trades.csv";
+const CSV_FILE = `${DATA_DIR}/trades.csv`;
 
 // Always ensure trades.csv exists with headers — open it in Excel/Sheets any time
 function initCsv() {
@@ -442,7 +728,7 @@ function writeTradeCsv(logEntry) {
   const row = [
     date,
     time,
-    "BitGet",
+    "Binance",
     logEntry.symbol,
     side,
     quantity,
@@ -522,7 +808,10 @@ async function run() {
   const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
   const closes = candles.map((c) => c.close);
   const price = closes[closes.length - 1];
-  console.log(`  Current price: $${price.toFixed(2)}`);
+  // Use last candle's high/low to catch TP/SL wicks missed between runs
+  const lastHigh = candles[candles.length - 1].high;
+  const lastLow  = candles[candles.length - 1].low;
+  console.log(`  Current price: $${price.toFixed(2)} | High: $${lastHigh.toFixed(2)} | Low: $${lastLow.toFixed(2)}`);
 
   // Calculate indicators
   const ema8 = calcEMA(closes, 8);
@@ -538,7 +827,68 @@ async function run() {
     return;
   }
 
-  // Run safety check
+  // ── Check open position ────────────────────────────────────────────────────
+  if (log.openPosition) {
+    const pos = log.openPosition;
+    // Check close price AND last candle high/low — catches TP/SL hit as a wick
+    const hitTP = pos.direction === "BUY" ? (price >= pos.tp || lastHigh >= pos.tp) : (price <= pos.tp || lastLow <= pos.tp);
+    const hitSL = pos.direction === "BUY" ? (price <= pos.sl || lastLow  <= pos.sl) : (price >= pos.sl || lastHigh >= pos.sl);
+
+    if (hitTP || hitSL) {
+      const exitReason = hitTP ? "TP HIT" : "SL HIT";
+      let actualExitPrice = price;
+
+      // In live mode, place real close order on Binance margin
+      if (!CONFIG.paperTrading) {
+        try {
+          const closeResult = await closeOrder(pos.symbol, pos.direction, pos.tradeSize, price);
+          actualExitPrice = closeResult.price || price;
+          console.log(`✅ CLOSE ORDER PLACED — ${closeResult.orderId} @ $${actualExitPrice}`);
+        } catch (err) {
+          console.log(`❌ CLOSE ORDER FAILED — ${err.message}`);
+          await sendTelegram(`⚠️ <b>Close order failed!</b>\nManually close your ${pos.direction} ${pos.symbol} position.\nError: ${err.message}`);
+        }
+      }
+
+      const closed = closePosition(actualExitPrice, exitReason, CONFIG.paperTrading ? "PAPER" : "LIVE");
+      const pnlUSD = closed.pnlUSD;
+      const pnlPct = closed.pnlPct;
+      const pnlIcon = pnlUSD >= 0 ? "🟢" : "🔴";
+      const exitIcon = hitTP ? "✅" : "❌";
+
+      console.log(`\n── Position Closed — ${exitReason} ${exitIcon} ──────────────`);
+      console.log(`  Direction: ${pos.direction} | ID: ${closed.id}`);
+      console.log(`  Entry: $${pos.entryPrice.toFixed(2)} → Exit: $${price.toFixed(2)}`);
+      console.log(`  P&L: ${pnlIcon} $${pnlUSD.toFixed(4)} (${pnlPct.toFixed(2)}%)`);
+
+      // Load updated performance to include in Telegram
+      const perf = existsSync(PERF_FILE)
+        ? JSON.parse(readFileSync(PERF_FILE, "utf8"))
+        : null;
+      const perfLine = perf
+        ? `\n📊 Strategy: ${perf.wins}W/${perf.losses}L | WR: ${perf.winRate}% | Total P&amp;L: ${perf.totalPnlUSD >= 0 ? "+" : ""}$${perf.totalPnlUSD.toFixed(3)} | ${perf.verdict}`
+        : "";
+
+      await sendTelegram(
+        `${pnlIcon} <b>CLOSED ${pos.direction} ${pos.symbol} 3m</b> [${exitReason} ${exitIcon}]\n` +
+        `Entry: $${pos.entryPrice.toFixed(2)} → Exit: $${price.toFixed(2)}\n` +
+        `P&amp;L: ${pnlUSD >= 0 ? "+" : ""}$${pnlUSD.toFixed(4)} (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%)` +
+        `${perfLine}`
+      );
+
+      delete log.openPosition;
+      saveLog(log);
+    } else {
+      console.log(`\n📌 Open position: ${pos.direction} @ $${pos.entryPrice.toFixed(2)} | TP $${pos.tp.toFixed(2)} | SL $${pos.sl.toFixed(2)} | Current $${price.toFixed(2)}`);
+    }
+  }
+
+  // Run safety check — skip entry if we already have an open position
+  if (log.openPosition) {
+    console.log("  Skipping new entry — position already open.");
+    return;
+  }
+
   const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
 
   // Calculate position size
@@ -550,11 +900,17 @@ async function run() {
   // Decision
   console.log("\n── Decision ─────────────────────────────────────────────\n");
 
+  const direction = price > vwap ? "BUY" : "SELL";
+  const { tp, sl } = calcTPSL(price, direction);
+
   const logEntry = {
     timestamp: new Date().toISOString(),
     symbol: CONFIG.symbol,
     timeframe: CONFIG.timeframe,
     price,
+    direction,
+    tp,
+    sl,
     indicators: { ema8, vwap, rsi3 },
     conditions: results,
     allPass,
@@ -579,19 +935,21 @@ async function run() {
 
     if (CONFIG.paperTrading) {
       console.log(
-        `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
+        `\n📋 PAPER TRADE — ${direction} ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
       );
+      console.log(`   TP: $${tp.toFixed(2)} | SL: $${sl.toFixed(2)}`);
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
     } else {
       console.log(
-        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${CONFIG.symbol}`,
+        `\n💰 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} ${direction} ${CONFIG.symbol}`,
       );
+      console.log(`   TP: $${tp.toFixed(2)} | SL: $${sl.toFixed(2)}`);
       try {
-        const order = await placeBitGetOrder(
+        const order = await placeOrder(
           CONFIG.symbol,
-          "buy",
+          direction,
           tradeSize,
           price,
         );
@@ -605,6 +963,35 @@ async function run() {
     }
   }
 
+  // Register executed trade in positions log and store in openPosition tracker
+  if (logEntry.orderPlaced) {
+    const posId = addOpenPosition({
+      symbol:     logEntry.symbol,
+      direction:  logEntry.direction,
+      entryPrice: logEntry.price,
+      tp:         logEntry.tp,
+      sl:         logEntry.sl,
+      sizeUSD:    logEntry.tradeSize,
+      entryTime:  logEntry.timestamp,
+      orderId:    logEntry.orderId,
+      mode:       CONFIG.paperTrading ? "PAPER" : "LIVE",
+    });
+    logEntry.positionId = posId;
+    console.log(`📌 Position registered → ${posId} | positions.json`);
+
+    log.openPosition = {
+      symbol:     logEntry.symbol,
+      direction:  logEntry.direction,
+      entryPrice: logEntry.price,
+      tp:         logEntry.tp,
+      sl:         logEntry.sl,
+      tradeSize:  logEntry.tradeSize,
+      entryTime:  logEntry.timestamp,
+      orderId:    logEntry.orderId,
+      positionId: posId,
+    };
+  }
+
   // Save decision log
   log.trades.push(logEntry);
   saveLog(log);
@@ -613,14 +1000,48 @@ async function run() {
   // Write tax CSV row for every run (executed, paper, or blocked)
   writeTradeCsv(logEntry);
 
+  // Telegram notification
+  const mode = CONFIG.paperTrading ? "📋 PAPER" : "💰 LIVE";
+  const dir = logEntry.direction; // "BUY" or "SELL"
+  const dirIcon = dir === "BUY" ? "🟢" : "🔴";
+  const { ema8: tgEma8, vwap: tgVwap, rsi3: tgRsi3 } = logEntry.indicators;
+  const failed = logEntry.conditions.filter(r => !r.pass).map(r => `  • ${r.label}`).join("\n");
+  const tgMsg = logEntry.allPass
+    ? `${dirIcon} <b>${CONFIG.paperTrading ? "PAPER " : ""}${dir} ${logEntry.symbol}</b> [3m | ${mode}]\n` +
+      `Entry: $${logEntry.price.toFixed(2)} | Size: $${logEntry.tradeSize.toFixed(2)}\n` +
+      `🎯 TP: $${logEntry.tp.toFixed(2)}  🛑 SL: $${logEntry.sl.toFixed(2)}\n` +
+      `RSI(3): ${tgRsi3.toFixed(1)} | EMA8: $${tgEma8.toFixed(2)} | VWAP: $${tgVwap.toFixed(2)}\n` +
+      `${logEntry.timestamp}`
+    : `⏸ <b>BLOCKED ${dir} — ${logEntry.symbol} 3m</b>\n` +
+      `Price: $${logEntry.price.toFixed(2)} | VWAP: $${tgVwap.toFixed(2)}\n` +
+      (failed ? `Failed:\n${failed}\n` : "") +
+      `${logEntry.timestamp}`;
+  await sendTelegram(tgMsg);
+
   console.log("═══════════════════════════════════════════════════════════\n");
 }
 
 if (process.argv.includes("--tax-summary")) {
   generateTaxSummary();
-} else {
-  run().catch((err) => {
-    console.error("Bot error:", err);
-    process.exit(1);
+} else if (process.env.SEND_TRADES_NOW === "true") {
+  // Set SEND_TRADES_NOW=true in Railway env vars to push the CSV to Telegram
+  sendTradesFile().then(() => {
+    console.log("Trades file sent. Remove SEND_TRADES_NOW var to resume normal operation.");
+    process.exit(0);
   });
+} else {
+  // Run in an infinite loop — no cron needed, always-on service
+  const INTERVAL_MS = 3 * 60 * 1000; // 3 minutes
+  (async () => {
+    while (true) {
+      try {
+        await run();
+      } catch (err) {
+        console.error("Bot error:", err.message);
+        await sendTelegram(`⚠️ <b>Bot error</b>\n${err.message}`);
+      }
+      console.log(`⏳ Next run in 3 minutes...\n`);
+      await new Promise((r) => setTimeout(r, INTERVAL_MS));
+    }
+  })();
 }
