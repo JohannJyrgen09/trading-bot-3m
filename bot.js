@@ -900,7 +900,7 @@ async function run() {
         }
       }
 
-      const closed = closePosition(actualExitPrice, exitReason, CONFIG.paperTrading ? "PAPER" : "LIVE");
+      const closed = await closePosition(actualExitPrice, exitReason, CONFIG.paperTrading ? "PAPER" : "LIVE");
       if (!closed) {
         console.error("⚠️  closePosition() returned null — position may be desynced. Clearing openPosition from log.");
         await sendTelegram(`⚠️ <b>Position close error</b>\nCould not find open position record for ${pos.direction} ${pos.symbol}. Cleared from log — check positions.json manually.`);
