@@ -795,13 +795,8 @@ async function run() {
   console.log(`\nStrategy: ${rules.strategy.name}`);
   console.log(`Symbol: ${CONFIG.symbol} | Timeframe: ${CONFIG.timeframe}`);
 
-  // Load log and check daily limits
+  // Load log
   const log = loadLog();
-  const withinLimits = checkTradeLimits(log);
-  if (!withinLimits) {
-    console.log("\nBot stopping — trade limits reached for today.");
-    return;
-  }
 
   // Fetch candle data — need enough for EMA(8) + full session for VWAP
   console.log("\n── Fetching market data from Binance ───────────────────\n");
@@ -827,7 +822,7 @@ async function run() {
     return;
   }
 
-  // ── Check open position ────────────────────────────────────────────────────
+  // ── Check open position FIRST — always manage open trades regardless of daily limit ──
   if (log.openPosition) {
     const pos = log.openPosition;
     // Check close price AND last candle high/low — catches TP/SL hit as a wick
@@ -886,6 +881,15 @@ async function run() {
   // Run safety check — skip entry if we already have an open position
   if (log.openPosition) {
     console.log("  Skipping new entry — position already open.");
+    return;
+  }
+
+  // Check daily trade limits BEFORE looking for new entries
+  const withinLimits = checkTradeLimits(log);
+  if (!withinLimits) {
+    const todayCount = countTodaysTrades(log);
+    console.log("\nBot paused — daily trade limit reached.");
+    await sendTelegram(`🚫 <b>Daily trade limit reached</b> (${todayCount}/${CONFIG.maxTradesPerDay}).\nBot is paused until midnight UTC — no new entries today.`);
     return;
   }
 
