@@ -10,7 +10,7 @@
  */
 
 import "dotenv/config";
-import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, appendFileSync, renameSync, copyFileSync } from "fs";
 import crypto from "crypto";
 import { execSync } from "child_process";
 
@@ -78,6 +78,7 @@ const CONFIG = {
   portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "10"),
+  maxDailyLossUSD: parseFloat(process.env.MAX_DAILY_LOSS_USD || "0"), // 0 = disabled
   paperTrading: process.env.PAPER_TRADING !== "false",
   tradeMode: process.env.TRADE_MODE || "spot",
   binance: {
@@ -106,13 +107,17 @@ function loadPositions() {
   try {
     return JSON.parse(readFileSync(POSITIONS_FILE, "utf8"));
   } catch {
-    console.error("⚠️  positions.json corrupted — resetting to empty.");
+    const backup = `${POSITIONS_FILE}.bak.${Date.now()}`;
+    try { copyFileSync(POSITIONS_FILE, backup); } catch {}
+    console.error(`⚠️  positions.json corrupted — backed up to ${backup}, resetting to empty.`);
     return [];
   }
 }
 
 function savePositions(positions) {
-  writeFileSync(POSITIONS_FILE, JSON.stringify(positions, null, 2));
+  const tmp = `${POSITIONS_FILE}.tmp`;
+  writeFileSync(tmp, JSON.stringify(positions, null, 2));
+  renameSync(tmp, POSITIONS_FILE);
 
   // Rebuild the CSV from scratch every time
   const rows = positions.map((p) =>
@@ -316,13 +321,17 @@ function loadLog() {
   try {
     return JSON.parse(readFileSync(LOG_FILE, "utf8"));
   } catch {
-    console.error("⚠️  log file corrupted — resetting.");
+    const backup = `${LOG_FILE}.bak.${Date.now()}`;
+    try { copyFileSync(LOG_FILE, backup); } catch {}
+    console.error(`⚠️  log file corrupted — backed up to ${backup}, resetting.`);
     return { trades: [], openPosition: null };
   }
 }
 
 function saveLog(log) {
-  writeFileSync(LOG_FILE, JSON.stringify(log, null, 2));
+  const tmp = `${LOG_FILE}.tmp`;
+  writeFileSync(tmp, JSON.stringify(log, null, 2));
+  renameSync(tmp, LOG_FILE);
 }
 
 function countTodaysTrades(log) {
@@ -352,18 +361,35 @@ async function fetchCandles(symbol, interval, limit = 100) {
   // data-api.binance.vision is Binance's global CDN mirror — same data,
   // no geo-blocking (accessible from US-based servers like Railway)
   const url = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
-  const data = await res.json();
 
-  return data.map((k) => ({
-    time: k[0],
-    open: parseFloat(k[1]),
-    high: parseFloat(k[2]),
-    low: parseFloat(k[3]),
-    close: parseFloat(k[4]),
-    volume: parseFloat(k[5]),
-  }));
+  // Retry up to 3 times with 2s backoff — guards against transient API failures
+  const MAX_RETRIES = 3;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000); // 8s timeout
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeout);
+      if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
+      const data = await res.json();
+      if (!Array.isArray(data) || data.length === 0) {
+        throw new Error("Binance returned empty candle data");
+      }
+      return data.map((k) => ({
+        time: k[0],
+        open: parseFloat(k[1]),
+        high: parseFloat(k[2]),
+        low: parseFloat(k[3]),
+        close: parseFloat(k[4]),
+        volume: parseFloat(k[5]),
+      }));
+    } catch (err) {
+      clearTimeout(timeout);
+      if (attempt === MAX_RETRIES) throw err;
+      console.warn(`  ⚠️ Binance fetch attempt ${attempt} failed: ${err.message} — retrying in 2s...`);
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
 }
 
 // ─── Indicator Calculations ──────────────────────────────────────────────────
@@ -509,6 +535,7 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
 
 function checkTradeLimits(log) {
   const todayCount = countTodaysTrades(log);
+  const today = new Date().toISOString().slice(0, 10);
 
   console.log("\n── Trade Limits ─────────────────────────────────────────\n");
 
@@ -517,6 +544,20 @@ function checkTradeLimits(log) {
       `🚫 Max trades per day reached: ${todayCount}/${CONFIG.maxTradesPerDay}`,
     );
     return false;
+  }
+
+  // Daily loss circuit breaker — stop trading if we've lost too much today
+  if (CONFIG.maxDailyLossUSD > 0) {
+    const todayPnl = log.trades
+      .filter((t) => t.timestamp.startsWith(today) && t.pnlUSD != null)
+      .reduce((s, t) => s + t.pnlUSD, 0);
+    if (todayPnl <= -CONFIG.maxDailyLossUSD) {
+      console.log(`🚫 Daily loss limit hit: $${todayPnl.toFixed(3)} / -$${CONFIG.maxDailyLossUSD}`);
+      return false;
+    }
+    if (todayPnl < 0) {
+      console.log(`⚠️  Today's P&L: $${todayPnl.toFixed(3)} (limit: -$${CONFIG.maxDailyLossUSD})`);
+    }
   }
 
   console.log(
