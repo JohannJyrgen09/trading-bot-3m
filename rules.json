@@ -1,41 +1,45 @@
 {
   "watchlist": ["BTCUSDT"],
-  "default_timeframe": "1m",
+  "default_timeframe": "3m",
 
   "strategy": {
-    "name": "VWAP + RSI(3) + EMA(8) Scalping Strategy",
-    "sources": ["Lewis Jackson"],
-    "description": "Three indicators, each doing a different job. EMA(8) for trend direction, VWAP for session bias, RSI(3) for entry timing. All three must align before a trade fires."
+    "name": "Donchian Momentum Breakout (3m)",
+    "sources": ["Claude — designed to be uncorrelated with the 5m VWAP+RSI pullback bot"],
+    "description": "Momentum breakout strategy. Wait for price to break a 20-bar range, confirm with EMA(50) trend + slope, require ATR(14) to be expanding, and reject anything more than 1.5% away from EMA(50). Trades the 'move' instead of the 'pullback' — different regime from the 5m bot, so drawdowns should be uncorrelated."
   },
 
   "indicators": {
-    "ema_8": "Trend direction. Price above EMA(8) = bullish momentum. Below = bearish.",
-    "vwap": "Session bias. Price above VWAP = buyers in control. Below = sellers. Resets at midnight UTC.",
-    "rsi_3": "Entry timing. RSI on 3 candles only — extremely sensitive. Below 30 in an uptrend = snap-back setup. Above 70 in a downtrend = reversal likely."
+    "donchian_20": "Entry trigger. Highest high / lowest low of the PRIOR 20 bars (current bar excluded). Close above upper = long breakout. Close below lower = short breakout.",
+    "ema_50": "Trend filter. Price must be on the right side AND the EMA must be sloping our way (current EMA vs 3 bars ago). 50-period on 3m ≈ 2.5 hours of smoothing.",
+    "atr_14": "Volatility filter. ATR(14) must exceed SMA(ATR, 20) — i.e. the market is 'waking up'. Avoids fakeouts in dead, flat ranges where breakouts reverse immediately."
   },
 
   "bias_criteria": {
-    "bullish": ["Price is above VWAP", "Price is above EMA(8)"],
-    "bearish": ["Price is below VWAP", "Price is below EMA(8)"]
+    "bullish": ["Close > Donchian upper (20)", "Price > EMA(50)", "EMA(50) rising"],
+    "bearish": ["Close < Donchian lower (20)", "Price < EMA(50)", "EMA(50) falling"]
   },
 
   "entry_rules": {
     "long": [
-      "Price is above VWAP — buyers in control for the session",
-      "Price is above EMA(8) — uptrend confirmed",
-      "RSI(3) has dropped below 30 — short-term pullback in an uptrend, snap-back likely"
+      "Close above 20-bar high — upside breakout confirmed",
+      "Price above EMA(50) — longer-term uptrend",
+      "EMA(50) rising vs 3 bars ago — slope agrees with breakout",
+      "ATR(14) > SMA(ATR, 20) — volatility is expanding, not a dead-market fakeout",
+      "Price within 1.5% of EMA(50) — don't chase a parabolic move"
     ],
     "short": [
-      "Price is below VWAP — sellers in control",
-      "Price is below EMA(8) — downtrend confirmed",
-      "RSI(3) has spiked above 70 — overbought in a downtrend, reversal likely"
+      "Close below 20-bar low — downside breakout confirmed",
+      "Price below EMA(50) — longer-term downtrend",
+      "EMA(50) falling vs 3 bars ago — slope agrees with breakout",
+      "ATR(14) > SMA(ATR, 20) — volatility is expanding",
+      "Price within 1.5% of EMA(50) — don't chase a parabolic move"
     ]
   },
 
   "exit_rules": [
-    "Exit when RSI(3) crosses back above 50 (for longs) or below 50 (for shorts)",
     "Hard stop: 0.3% below entry for longs, 0.3% above entry for shorts (SL_PCT in .env)",
-    "Take profit: 1.05% target (TP_PCT in .env) — chosen so that AFTER round-trip fees (0.15%) the true R:R is 2:1"
+    "Take profit: 1.05% target (TP_PCT in .env) — chosen so that AFTER round-trip fees (0.15%) the true R:R is 2:1",
+    "No momentum-based early exit — breakouts need room to run. Let TP/SL do the work."
   ],
 
   "risk_rules": [
@@ -46,8 +50,8 @@
     "Max margin per trade capped by MAX_TRADE_SIZE_USD (acts as a hard ceiling — if risk formula would exceed it, position size scales down and actual $ risk drops proportionally).",
     "Max trades per day capped by MAX_TRADES_PER_DAY in .env",
     "Daily loss circuit breaker: bot halts trading for the UTC day if cumulative P&L ≤ -MAX_DAILY_LOSS_USD",
-    "Do not trade if price is more than 1.5% away from VWAP — overextended",
-    "Paper trade first — validate this strategy on your specific asset before going live"
+    "Do not trade if price is more than 1.5% away from EMA(50) — overextended / late to the move",
+    "Paper trade first — breakout strategies need validation on YOUR asset before going live"
   ],
 
   "fees_and_costs": {
@@ -56,5 +60,5 @@
     "borrow_interest": "HOURLY_BORROW_PCT in .env, default 0.0008%/hr (~7% APY) on borrowed portion. Negligible for sub-hour scalps (<$0.01 per trade)."
   },
 
-  "notes": "Scalping strategy — designed for 1m to 5m timeframes. RSI(3) is intentionally fast and sensitive. Do not apply to higher timeframes."
+  "notes": "Breakout strategy — designed for 3m timeframe. Most candles produce NO signal (this is expected and correct — breakouts are rare events). Paired with the 5m pullback bot to trade two uncorrelated regimes simultaneously. Do not apply to higher timeframes without re-tuning Donchian period and EMA length."
 }

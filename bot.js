@@ -439,50 +439,73 @@ async function fetchCandles(symbol, interval, limit = 100) {
   }
 }
 
-// ─── Indicator Calculations ──────────────────────────────────────────────────
+// ─── Indicator Calculations (3m: Donchian Momentum Breakout) ────────────────
+// Strategy: break out of 20-bar range + trend filter (EMA50) + volatility filter (ATR expansion).
+// Different regime from the 5m bot (pullback mean-reversion) to decorrelate drawdowns.
 
-function calcEMA(closes, period) {
+function calcSMA(arr, period) {
+  if (arr.length < period) return null;
+  const slice = arr.slice(arr.length - period);
+  return slice.reduce((a, b) => a + b, 0) / period;
+}
+
+// Full EMA series — we need it for slope (value N bars ago).
+function calcEMASeries(closes, period) {
+  if (closes.length < period) return [];
   const multiplier = 2 / (period + 1);
+  const out = new Array(closes.length).fill(null);
   let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  out[period - 1] = ema;
   for (let i = period; i < closes.length; i++) {
     ema = closes[i] * multiplier + ema * (1 - multiplier);
+    out[i] = ema;
   }
-  return ema;
+  return out;
 }
 
-function calcRSI(closes, period = 14) {
-  if (closes.length < period + 1) return null;
-  let gains = 0,
-    losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
-    if (diff > 0) gains += diff;
-    else losses -= diff;
+// True Range: max(high−low, |high−prevClose|, |low−prevClose|)
+function calcATRSeries(candles, period = 14) {
+  if (candles.length < period + 1) return [];
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const h = candles[i].high;
+    const l = candles[i].low;
+    const pc = candles[i - 1].close;
+    trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
   }
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - 100 / (1 + rs);
+  // Wilder's smoothing: first ATR = SMA(TR, period), then ATR[i] = (ATR[i-1]*(period-1) + TR[i]) / period
+  const out = [];
+  let atr = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  out[period - 1] = atr;
+  for (let i = period; i < trs.length; i++) {
+    atr = (atr * (period - 1) + trs[i]) / period;
+    out[i] = atr;
+  }
+  return out;
 }
 
-// VWAP — session-based, resets at midnight UTC
-function calcVWAP(candles) {
-  const midnightUTC = new Date();
-  midnightUTC.setUTCHours(0, 0, 0, 0);
-  const sessionCandles = candles.filter((c) => c.time >= midnightUTC.getTime());
-  if (sessionCandles.length === 0) return null;
-  const cumTPV = sessionCandles.reduce(
-    (sum, c) => sum + ((c.high + c.low + c.close) / 3) * c.volume,
-    0,
-  );
-  const cumVol = sessionCandles.reduce((sum, c) => sum + c.volume, 0);
-  return cumVol === 0 ? null : cumTPV / cumVol;
+// Donchian Channel — highest high / lowest low over last `period` candles,
+// EXCLUDING the current (last) candle so a breakout means close > prior range.
+function calcDonchian(candles, period = 20) {
+  if (candles.length < period + 1) return null;
+  const lookback = candles.slice(-period - 1, -1); // last `period` BEFORE current
+  let upper = -Infinity;
+  let lower = +Infinity;
+  for (const c of lookback) {
+    if (c.high > upper) upper = c.high;
+    if (c.low  < lower) lower = c.low;
+  }
+  return { upper, lower, middle: (upper + lower) / 2 };
 }
 
 // ─── Safety Check ───────────────────────────────────────────────────────────
 
-function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
+// Strategy: Donchian Momentum Breakout.
+// - Entry trigger: close breaks above 20-bar high (long) or below 20-bar low (short)
+// - Trend filter:  EMA(50) on the right side AND sloping our way over last 3 bars
+// - Volatility:    ATR(14) must be expanding (> SMA(ATR, 20)) — avoids dead-market fakeouts
+// - Anti-chase:    price within 1.5% of EMA(50) (don't buy a parabolic top)
+function runSafetyCheck(price, donchian, ema50, ema50Prev, atr, atrAvg, _rules) {
   const results = [];
 
   const check = (label, required, actual, pass) => {
@@ -494,88 +517,90 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
 
   console.log("\n── Safety Check ─────────────────────────────────────────\n");
 
-  // Determine bias using VWAP only — price above VWAP = bullish, below = bearish
-  const bullishBias = price > vwap;
-  const bearishBias = price < vwap;
+  // Direction is determined by WHICH side of the Donchian range price is breaking out of.
+  const brokeUp   = price > donchian.upper;
+  const brokeDown = price < donchian.lower;
+  const emaRising  = ema50 > ema50Prev;
+  const emaFalling = ema50 < ema50Prev;
+  const atrExpanding = atr > atrAvg;
+  const distFromEMA = Math.abs((price - ema50) / ema50) * 100;
 
-  if (bullishBias) {
-    console.log("  Bias: BULLISH — checking long entry conditions\n");
-
-    // 1. Price above VWAP
+  if (brokeUp) {
+    console.log("  Bias: BULLISH BREAKOUT — checking long entry conditions\n");
     check(
-      "Price above VWAP (buyers in control)",
-      `> ${vwap.toFixed(2)}`,
+      "Close above 20-bar high (upside breakout)",
+      `> ${donchian.upper.toFixed(2)}`,
       price.toFixed(2),
-      price > vwap,
+      brokeUp,
     );
-
-    // 2. Price above EMA(8)
     check(
-      "Price above EMA(8) (uptrend confirmed)",
-      `> ${ema8.toFixed(2)}`,
+      "Price above EMA(50) (uptrend confirmed)",
+      `> ${ema50.toFixed(2)}`,
       price.toFixed(2),
-      price > ema8,
+      price > ema50,
     );
-
-    // 3. RSI(3) pullback
     check(
-      "RSI(3) below 30 (snap-back setup in uptrend)",
-      "< 30",
-      rsi3.toFixed(2),
-      rsi3 < 30,
+      "EMA(50) rising over last 3 bars (slope up)",
+      `> ${ema50Prev.toFixed(2)}`,
+      ema50.toFixed(2),
+      emaRising,
     );
-
-    // 4. Not overextended from VWAP
-    const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
     check(
-      "Price within 1.5% of VWAP (not overextended)",
+      "ATR(14) expanding vs SMA(ATR, 20) (volatility real)",
+      `> ${atrAvg.toFixed(4)}`,
+      atr.toFixed(4),
+      atrExpanding,
+    );
+    check(
+      "Within 1.5% of EMA(50) (not chasing a parabolic move)",
       "< 1.5%",
-      `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
+      `${distFromEMA.toFixed(2)}%`,
+      distFromEMA < 1.5,
     );
-  } else if (bearishBias) {
-    console.log("  Bias: BEARISH — checking short entry conditions\n");
-
+  } else if (brokeDown) {
+    console.log("  Bias: BEARISH BREAKOUT — checking short entry conditions\n");
     check(
-      "Price below VWAP (sellers in control)",
-      `< ${vwap.toFixed(2)}`,
+      "Close below 20-bar low (downside breakout)",
+      `< ${donchian.lower.toFixed(2)}`,
       price.toFixed(2),
-      price < vwap,
+      brokeDown,
     );
-
     check(
-      "Price below EMA(8) (downtrend confirmed)",
-      `< ${ema8.toFixed(2)}`,
+      "Price below EMA(50) (downtrend confirmed)",
+      `< ${ema50.toFixed(2)}`,
       price.toFixed(2),
-      price < ema8,
+      price < ema50,
     );
-
     check(
-      "RSI(3) above 70 (reversal setup in downtrend)",
-      "> 70",
-      rsi3.toFixed(2),
-      rsi3 > 70,
+      "EMA(50) falling over last 3 bars (slope down)",
+      `< ${ema50Prev.toFixed(2)}`,
+      ema50.toFixed(2),
+      emaFalling,
     );
-
-    const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
     check(
-      "Price within 1.5% of VWAP (not overextended)",
+      "ATR(14) expanding vs SMA(ATR, 20) (volatility real)",
+      `> ${atrAvg.toFixed(4)}`,
+      atr.toFixed(4),
+      atrExpanding,
+    );
+    check(
+      "Within 1.5% of EMA(50) (not chasing a parabolic move)",
       "< 1.5%",
-      `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
+      `${distFromEMA.toFixed(2)}%`,
+      distFromEMA < 1.5,
     );
   } else {
-    console.log("  Bias: NEUTRAL — no clear direction. No trade.\n");
+    console.log("  Bias: NO BREAKOUT — price inside Donchian range. No trade.\n");
     results.push({
-      label: "Market bias",
-      required: "Bullish or bearish",
-      actual: "Neutral",
+      label: "Donchian breakout",
+      required: `< ${donchian.lower.toFixed(2)} or > ${donchian.upper.toFixed(2)}`,
+      actual: price.toFixed(2),
       pass: false,
     });
   }
 
   const allPass = results.every((r) => r.pass);
-  return { results, allPass };
+  return { results, allPass, direction: brokeUp ? "BUY" : (brokeDown ? "SELL" : null) };
 }
 
 // ─── Trade Limits ────────────────────────────────────────────────────────────
@@ -937,7 +962,7 @@ async function run() {
   // Load log
   const log = loadLog();
 
-  // Fetch candle data — need enough for EMA(8) + full session for VWAP
+  // Fetch candle data — need ≥50 candles for EMA(50) + 20 for Donchian + 14 for ATR
   console.log("\n── Fetching market data from Binance ───────────────────\n");
   const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
   const closes = candles.map((c) => c.close);
@@ -947,19 +972,23 @@ async function run() {
   const lastLow  = candles[candles.length - 1].low;
   console.log(`  Current price: $${price.toFixed(2)} | High: $${lastHigh.toFixed(2)} | Low: $${lastLow.toFixed(2)}`);
 
-  // Calculate indicators
-  const ema8 = calcEMA(closes, 8);
-  const vwap = calcVWAP(candles);
-  const rsi3 = calcRSI(closes, 3);
+  // Calculate indicators — Donchian Momentum Breakout strategy
+  const emaSeries  = calcEMASeries(closes, 50);
+  const ema50      = emaSeries[emaSeries.length - 1];
+  const ema50Prev  = emaSeries[emaSeries.length - 4]; // 3 bars ago → slope
+  const donchian   = calcDonchian(candles, 20);
+  const atrSeries  = calcATRSeries(candles, 14);
+  const atr        = atrSeries[atrSeries.length - 1];
+  const atrAvg     = calcSMA(atrSeries.filter(v => v != null), 20);
 
-  console.log(`  EMA(8):  $${ema8.toFixed(2)}`);
-  console.log(`  VWAP:    $${vwap ? vwap.toFixed(2) : "N/A"}`);
-  console.log(`  RSI(3):  ${rsi3 ? rsi3.toFixed(2) : "N/A"}`);
-
-  if (!vwap || !rsi3) {
-    console.log("\n⚠️  Not enough data to calculate indicators. Exiting.");
+  if (!ema50 || !ema50Prev || !donchian || !atr || !atrAvg) {
+    console.log("\n⚠️  Not enough data to calculate indicators (need ≥ 50 candles). Exiting.");
     return;
   }
+
+  console.log(`  EMA(50):         $${ema50.toFixed(2)}  (3 bars ago: $${ema50Prev.toFixed(2)} → ${ema50 > ema50Prev ? "↑ rising" : "↓ falling"})`);
+  console.log(`  Donchian(20):    upper $${donchian.upper.toFixed(2)} | lower $${donchian.lower.toFixed(2)} | mid $${donchian.middle.toFixed(2)}`);
+  console.log(`  ATR(14):         ${atr.toFixed(4)}  vs SMA(ATR,20) ${atrAvg.toFixed(4)}  → ${atr > atrAvg ? "↑ expanding" : "↓ contracting"}`);
 
   // ── Check open position FIRST — always manage open trades regardless of daily limit ──
   if (log.openPosition) {
@@ -1049,7 +1078,7 @@ async function run() {
     return;
   }
 
-  const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
+  const { results, allPass, direction: breakoutDir } = runSafetyCheck(price, donchian, ema50, ema50Prev, atr, atrAvg, rules);
 
   // ─── Risk-based position sizing ──────────────────────────────────────────
   // Example (user's model): $500 × 1% = $5 risk. 0.3% SL → notional = $5/0.003 = $1,666.67.
@@ -1069,14 +1098,12 @@ async function run() {
   // Decision
   console.log("\n── Decision ─────────────────────────────────────────────\n");
 
-  // Direction requires BOTH VWAP and EMA(8) to agree — avoids conflicting signal trades
-  const bullishSignal = price > vwap && price > ema8;
-  const bearishSignal = price < vwap && price < ema8;
-  if (!bullishSignal && !bearishSignal) {
-    console.log("  ⏸ Mixed signals — VWAP and EMA(8) disagree. Skipping this candle.");
+  // Direction is set by which side of the Donchian range broke. No breakout → skip.
+  if (!breakoutDir) {
+    console.log("  ⏸ No Donchian breakout this candle. Skipping.");
     return;
   }
-  const direction = bullishSignal ? "BUY" : "SELL";
+  const direction = breakoutDir;
   const { tp, sl } = calcTPSL(price, direction);
 
   const logEntry = {
@@ -1087,7 +1114,7 @@ async function run() {
     direction,
     tp,
     sl,
-    indicators: { ema8, vwap, rsi3 },
+    indicators: { ema50, ema50Prev, donchianUpper: donchian.upper, donchianLower: donchian.lower, atr, atrAvg },
     conditions: results,
     allPass,
     tradeSize,
@@ -1184,16 +1211,16 @@ async function run() {
   const mode = CONFIG.paperTrading ? "📋 PAPER" : "💰 LIVE";
   const dir = logEntry.direction; // "BUY" or "SELL"
   const dirIcon = dir === "BUY" ? "🟢" : "🔴";
-  const { ema8: tgEma8, vwap: tgVwap, rsi3: tgRsi3 } = logEntry.indicators;
+  const { ema50: tgEma50, donchianUpper: tgDU, donchianLower: tgDL, atr: tgAtr, atrAvg: tgAtrAvg } = logEntry.indicators;
   const failed = logEntry.conditions.filter(r => !r.pass).map(r => `  • ${r.label}`).join("\n");
   const tgMsg = logEntry.allPass
-    ? `${dirIcon} <b>${CONFIG.paperTrading ? "PAPER " : ""}${dir} ${logEntry.symbol}</b> [3m | ${mode} | ${CONFIG.leverage}x ${CONFIG.marginMode}]\n` +
+    ? `${dirIcon} <b>${CONFIG.paperTrading ? "PAPER " : ""}${dir} ${logEntry.symbol}</b> [3m Donchian Breakout | ${mode} | ${CONFIG.leverage}x ${CONFIG.marginMode}]\n` +
       `Entry: $${logEntry.price.toFixed(2)} | Margin: $${logEntry.tradeSize.toFixed(2)}\n` +
       `🎯 TP: $${logEntry.tp.toFixed(2)}  🛑 SL: $${logEntry.sl.toFixed(2)}\n` +
-      `RSI(3): ${tgRsi3.toFixed(1)} | EMA8: $${tgEma8.toFixed(2)} | VWAP: $${tgVwap.toFixed(2)}\n` +
+      `Donchian(20): $${tgDL.toFixed(2)}–$${tgDU.toFixed(2)} | EMA50: $${tgEma50.toFixed(2)} | ATR: ${tgAtr.toFixed(3)} (avg ${tgAtrAvg.toFixed(3)})\n` +
       `${logEntry.timestamp}`
     : `⏸ <b>BLOCKED ${dir} — ${logEntry.symbol} 3m</b>\n` +
-      `Price: $${logEntry.price.toFixed(2)} | VWAP: $${tgVwap.toFixed(2)}\n` +
+      `Price: $${logEntry.price.toFixed(2)} | EMA50: $${tgEma50.toFixed(2)} | Donchian: $${tgDL.toFixed(2)}–$${tgDU.toFixed(2)}\n` +
       (failed ? `Failed:\n${failed}\n` : "") +
       `${logEntry.timestamp}`;
   await sendTelegram(tgMsg);
