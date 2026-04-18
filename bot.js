@@ -79,6 +79,14 @@ const CONFIG = {
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "10"),
   maxDailyLossUSD: parseFloat(process.env.MAX_DAILY_LOSS_USD || "0"), // 0 = disabled
+  leverage: Math.max(1, parseFloat(process.env.LEVERAGE || "10")), // 1 = spot, 10 = Binance isolated margin max
+  takerFeePct: parseFloat(process.env.TAKER_FEE_PCT || "0.00075"), // 0.075% = Binance SPOT taker w/ BNB discount
+  marginMode: process.env.MARGIN_MODE || "isolated", // "isolated" | "cross" — Binance spot margin (no futures in your region)
+  hourlyBorrowPct: parseFloat(process.env.HOURLY_BORROW_PCT || "0.000008"), // 0.0008%/hr ≈ 7% APY (Binance USDT cross margin VIP0)
+  // Risk-based sizing: notional = (portfolio × riskPct) / slPct. Single source of truth for TP/SL used everywhere.
+  riskPerTradePct: parseFloat(process.env.RISK_PER_TRADE_PCT || "0.01"), // 1% of portfolio per trade
+  slPct: parseFloat(process.env.SL_PCT || "0.003"), // 0.3% hard stop — from rules.json
+  tpPct: parseFloat(process.env.TP_PCT || "0.006"), // 0.6% take profit — 2:1 RR
   paperTrading: process.env.PAPER_TRADING !== "false",
   tradeMode: process.env.TRADE_MODE || "spot",
   binance: {
@@ -145,6 +153,12 @@ function savePositions(positions) {
 function addOpenPosition(trade) {
   const positions = loadPositions();
   const id = `T${String(positions.length + 1).padStart(4, "0")}`;
+  const leverage        = trade.leverage        ?? CONFIG.leverage        ?? 1;
+  const takerFeePct     = trade.takerFeePct     ?? CONFIG.takerFeePct     ?? 0;
+  const marginMode      = trade.marginMode      ?? CONFIG.marginMode      ?? "isolated";
+  const hourlyBorrowPct = trade.hourlyBorrowPct ?? CONFIG.hourlyBorrowPct ?? 0;
+  const notionalUSD     = trade.sizeUSD * leverage;
+  const borrowedUSD     = Math.max(0, notionalUSD - trade.sizeUSD); // amount borrowed from Binance
   positions.push({
     id,
     symbol:     trade.symbol,
@@ -153,7 +167,13 @@ function addOpenPosition(trade) {
     entryPrice: trade.entryPrice,
     tp:         trade.tp,
     sl:         trade.sl,
-    sizeUSD:    trade.sizeUSD,
+    sizeUSD:    trade.sizeUSD,     // collateral / margin
+    leverage,                       // e.g. 10
+    notionalUSD,                    // sizeUSD × leverage
+    borrowedUSD,                    // notional − collateral (amount borrowed)
+    marginMode,                     // "isolated" | "cross"
+    takerFeePct,                    // snapshot of fee rate at entry
+    hourlyBorrowPct,                // snapshot of hourly borrow interest rate
     closeTime:  null,
     exitPrice:  null,
     pnlUSD:     null,
@@ -173,20 +193,47 @@ async function closePosition(exitPrice, exitReason, mode) {
   if (idx === -1) return null;
 
   const pos = positions[idx];
-  const pnlUSD = pos.direction === "BUY"
-    ? (exitPrice - pos.entryPrice) / pos.entryPrice * pos.sizeUSD
-    : (pos.entryPrice - exitPrice) / pos.entryPrice * pos.sizeUSD;
-  const pnlPct = pos.direction === "BUY"
-    ? (exitPrice - pos.entryPrice) / pos.entryPrice * 100
-    : (pos.entryPrice - exitPrice) / pos.entryPrice * 100;
+  // Backward-compat: older records pre-leverage default to 1x / 0% fees
+  const leverage        = pos.leverage        ?? 1;
+  const takerFeePct     = pos.takerFeePct     ?? 0;
+  const hourlyBorrowPct = pos.hourlyBorrowPct ?? 0;
+  const notionalUSD     = pos.notionalUSD     ?? pos.sizeUSD * leverage;
+  const borrowedUSD     = pos.borrowedUSD     ?? Math.max(0, notionalUSD - pos.sizeUSD);
+
+  // Gross price move (percentage change, signed by direction)
+  const priceMove = pos.direction === "BUY"
+    ? (exitPrice - pos.entryPrice) / pos.entryPrice
+    : (pos.entryPrice - exitPrice) / pos.entryPrice;
+
+  // Gross P&L in USD (on full notional — this is where leverage amplifies)
+  const grossPnlUSD = priceMove * notionalUSD;
+
+  // Round-trip taker fees: entry @ entryPrice, exit @ exitPrice
+  const entryFee = notionalUSD                        * takerFeePct;
+  const exitFee  = notionalUSD * (1 + priceMove)      * takerFeePct; // exit notional ≈ entry × (1 + move)
+  const feesUSD  = entryFee + exitFee;
+
+  // Borrow interest on the BORROWED portion for the holding period
+  const holdingMs   = Date.now() - new Date(pos.entryTime).getTime();
+  const holdingHrs  = Math.max(0, holdingMs) / 3_600_000;
+  const borrowUSD   = borrowedUSD * hourlyBorrowPct * holdingHrs;
+
+  const pnlUSD = grossPnlUSD - feesUSD - borrowUSD;
+
+  // ROE — return on equity (collateral), the number that actually matters with leverage
+  const pnlPct = pos.sizeUSD > 0 ? (pnlUSD / pos.sizeUSD) * 100 : 0;
 
   positions[idx] = {
     ...pos,
-    closeTime:  new Date().toISOString(),
+    closeTime:   new Date().toISOString(),
     exitPrice,
+    priceMovePct: parseFloat((priceMove * 100).toFixed(4)),
+    grossPnlUSD:  parseFloat(grossPnlUSD.toFixed(4)),
+    feesUSD:      parseFloat(feesUSD.toFixed(4)),
+    borrowUSD:    parseFloat(borrowUSD.toFixed(6)),
     pnlUSD,
     pnlPct,
-    result:     pnlUSD >= 0 ? "WIN" : "LOSS",
+    result:      pnlUSD >= 0 ? "WIN" : "LOSS",
     exitReason,
   };
 
@@ -564,20 +611,16 @@ function checkTradeLimits(log) {
     `✅ Trades today: ${todayCount}/${CONFIG.maxTradesPerDay} — within limit`,
   );
 
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
-  );
-
-  if (tradeSize > CONFIG.maxTradeSizeUSD) {
-    console.log(
-      `🚫 Trade size $${tradeSize.toFixed(2)} exceeds max $${CONFIG.maxTradeSizeUSD}`,
-    );
-    return false;
-  }
+  // Risk-based sizing preview (same formula used in the entry block below)
+  const riskUSD        = CONFIG.portfolioValue * CONFIG.riskPerTradePct;
+  const targetNotional = riskUSD / CONFIG.slPct;
+  const targetMargin   = targetNotional / CONFIG.leverage;
+  const tradeMargin    = Math.min(targetMargin, CONFIG.maxTradeSizeUSD);
+  const tradeNotional  = tradeMargin * CONFIG.leverage;
+  const effectiveRisk  = tradeNotional * CONFIG.slPct;
 
   console.log(
-    `✅ Trade size: $${tradeSize.toFixed(2)} — within max $${CONFIG.maxTradeSizeUSD}`,
+    `✅ Sizing: risk $${effectiveRisk.toFixed(2)} @ SL ${(CONFIG.slPct * 100).toFixed(2)}% → margin $${tradeMargin.toFixed(2)} @ ${CONFIG.leverage}x (cap $${CONFIG.maxTradeSizeUSD})`,
   );
 
   return true;
@@ -645,8 +688,8 @@ async function closeOrder(symbol, side, sizeUSD, price) {
 // ─── TP / SL Calculation (van de Poppe 2:1 RR, 0.3% SL from rules.json) ──────
 
 function calcTPSL(entryPrice, direction) {
-  const SL_PCT = 0.003; // 0.3% hard stop — from rules.json
-  const TP_PCT = 0.006; // 0.6% take profit — 2:1 RR (van de Poppe minimum)
+  const SL_PCT = CONFIG.slPct;
+  const TP_PCT = CONFIG.tpPct;
   if (direction === "BUY") {
     return {
       tp: parseFloat((entryPrice * (1 + TP_PCT)).toFixed(4)),
@@ -932,7 +975,9 @@ async function run() {
       // In live mode, place real close order on Binance margin
       if (!CONFIG.paperTrading) {
         try {
-          const closeResult = await closeOrder(pos.symbol, pos.direction, pos.tradeSize, price);
+          // Close at notional so AUTO_REPAY settles the full borrowed position (fallback: margin for legacy)
+          const closeSizeUSD = pos.notionalUSD ?? (pos.tradeSize * (pos.leverage ?? 1));
+          const closeResult = await closeOrder(pos.symbol, pos.direction, closeSizeUSD, price);
           actualExitPrice = closeResult.price || price;
           console.log(`✅ CLOSE ORDER PLACED — ${closeResult.orderId} @ $${actualExitPrice}`);
         } catch (err) {
@@ -967,10 +1012,18 @@ async function run() {
         ? `\n📊 Strategy: ${perf.wins}W/${perf.losses}L | WR: ${perf.winRate}% | Total P&amp;L: ${perf.totalPnlUSD >= 0 ? "+" : ""}$${perf.totalPnlUSD.toFixed(3)} | ${perf.verdict}`
         : "";
 
+      const lev  = closed.leverage ?? 1;
+      const fees = closed.feesUSD  ?? 0;
+      const gross = closed.grossPnlUSD ?? pnlUSD;
+      const borrow = closed.borrowUSD ?? 0;
+      const feeLine = lev > 1
+        ? `\n⚙ ${lev}x ${closed.marginMode ?? "isolated"} | Gross: $${gross.toFixed(3)} | Fees: -$${fees.toFixed(3)}${borrow > 0.0005 ? ` | Borrow: -$${borrow.toFixed(3)}` : ""}`
+        : "";
       await sendTelegram(
         `${pnlIcon} <b>CLOSED ${pos.direction} ${pos.symbol} 3m</b> [${exitReason} ${exitIcon}]\n` +
         `Entry: $${pos.entryPrice.toFixed(2)} → Exit: $${price.toFixed(2)}\n` +
-        `P&amp;L: ${pnlUSD >= 0 ? "+" : ""}$${pnlUSD.toFixed(4)} (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%)` +
+        `P&amp;L: ${pnlUSD >= 0 ? "+" : ""}$${pnlUSD.toFixed(4)} (ROE ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%)` +
+        `${feeLine}` +
         `${perfLine}`
       );
 
@@ -998,11 +1051,20 @@ async function run() {
 
   const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
 
-  // Calculate position size
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
-  );
+  // ─── Risk-based position sizing ──────────────────────────────────────────
+  // Example (user's model): $500 × 1% = $5 risk. 0.3% SL → notional = $5/0.003 = $1,666.67.
+  // At 10x leverage, required margin = $1,666.67 / 10 = $166.67.
+  // If margin > MAX_TRADE_SIZE_USD cap, size is scaled down and actual $ risk drops proportionally.
+  const riskUSD        = CONFIG.portfolioValue * CONFIG.riskPerTradePct;
+  const targetNotional = riskUSD / CONFIG.slPct;
+  const targetMargin   = targetNotional / CONFIG.leverage;
+  const tradeSize      = Math.min(targetMargin, CONFIG.maxTradeSizeUSD); // tradeSize = MARGIN (collateral)
+  const notionalUSD    = tradeSize * CONFIG.leverage;
+  const actualRiskUSD  = notionalUSD * CONFIG.slPct;
+  const riskCapped     = tradeSize < targetMargin - 0.01;
+  if (riskCapped) {
+    console.log(`  ⚠️ Margin capped by MAX_TRADE_SIZE_USD ($${CONFIG.maxTradeSizeUSD}) — actual risk $${actualRiskUSD.toFixed(2)} instead of $${riskUSD.toFixed(2)}`);
+  }
 
   // Decision
   console.log("\n── Decision ─────────────────────────────────────────────\n");
@@ -1042,7 +1104,7 @@ async function run() {
 
     if (CONFIG.paperTrading) {
       console.log(
-        `\n📋 PAPER TRADE — ${direction} ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
+        `\n📋 PAPER TRADE — ${direction} ${CONFIG.symbol} | Margin $${tradeSize.toFixed(2)} @ ${CONFIG.leverage}x ${CONFIG.marginMode}`,
       );
       console.log(`   TP: $${tp.toFixed(2)} | SL: $${sl.toFixed(2)}`);
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
@@ -1050,14 +1112,16 @@ async function run() {
       logEntry.orderId = `PAPER-${Date.now()}`;
     } else {
       console.log(
-        `\n💰 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} ${direction} ${CONFIG.symbol}`,
+        `\n💰 PLACING LIVE ORDER — ${direction} ${CONFIG.symbol} | Margin $${tradeSize.toFixed(2)} @ ${CONFIG.leverage}x ${CONFIG.marginMode}`,
       );
       console.log(`   TP: $${tp.toFixed(2)} | SL: $${sl.toFixed(2)}`);
       try {
+        // Live margin: spend the full NOTIONAL — Binance auto-borrows (notional − margin) via MARGIN_BUY.
+        // Passing just `tradeSize` would execute as 1x (no borrow activated).
         const order = await placeOrder(
           CONFIG.symbol,
           direction,
-          tradeSize,
+          notionalUSD,
           price,
         );
         logEntry.orderPlaced = true;
@@ -1092,7 +1156,9 @@ async function run() {
       entryPrice: logEntry.price,
       tp:         logEntry.tp,
       sl:         logEntry.sl,
-      tradeSize:  logEntry.tradeSize,
+      tradeSize:  logEntry.tradeSize,           // margin
+      notionalUSD: logEntry.tradeSize * CONFIG.leverage, // for live closeOrder
+      leverage:   CONFIG.leverage,
       entryTime:  logEntry.timestamp,
       orderId:    logEntry.orderId,
       positionId: posId,
@@ -1114,8 +1180,8 @@ async function run() {
   const { ema8: tgEma8, vwap: tgVwap, rsi3: tgRsi3 } = logEntry.indicators;
   const failed = logEntry.conditions.filter(r => !r.pass).map(r => `  • ${r.label}`).join("\n");
   const tgMsg = logEntry.allPass
-    ? `${dirIcon} <b>${CONFIG.paperTrading ? "PAPER " : ""}${dir} ${logEntry.symbol}</b> [3m | ${mode}]\n` +
-      `Entry: $${logEntry.price.toFixed(2)} | Size: $${logEntry.tradeSize.toFixed(2)}\n` +
+    ? `${dirIcon} <b>${CONFIG.paperTrading ? "PAPER " : ""}${dir} ${logEntry.symbol}</b> [3m | ${mode} | ${CONFIG.leverage}x ${CONFIG.marginMode}]\n` +
+      `Entry: $${logEntry.price.toFixed(2)} | Margin: $${logEntry.tradeSize.toFixed(2)}\n` +
       `🎯 TP: $${logEntry.tp.toFixed(2)}  🛑 SL: $${logEntry.sl.toFixed(2)}\n` +
       `RSI(3): ${tgRsi3.toFixed(1)} | EMA8: $${tgEma8.toFixed(2)} | VWAP: $${tgVwap.toFixed(2)}\n` +
       `${logEntry.timestamp}`

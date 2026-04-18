@@ -34,17 +34,27 @@
 
   "exit_rules": [
     "Exit when RSI(3) crosses back above 50 (for longs) or below 50 (for shorts)",
-    "Hard stop: 0.3% below entry for longs, 0.3% above entry for shorts",
-    "Take profit at next VWAP touch or EMA(8) cross"
+    "Hard stop: 0.3% below entry for longs, 0.3% above entry for shorts (SL_PCT in .env)",
+    "Take profit: 1.05% target (TP_PCT in .env) — chosen so that AFTER round-trip fees (0.15%) the true R:R is 2:1"
   ],
 
   "risk_rules": [
-    "Risk maximum 1% of portfolio per trade",
-    "Maximum trade size capped by MAX_TRADE_SIZE_USD in .env",
-    "Maximum trades per day capped by MAX_TRADES_PER_DAY in .env",
+    "Risk maximum 1% of portfolio per trade (RISK_PER_TRADE_PCT in .env)",
+    "Position sizing is RISK-BASED: notional = (portfolio × risk%) / stopLoss%. Margin = notional / leverage.",
+    "Example: $500 portfolio × 1% risk / 0.3% SL = $1,666.67 notional. At 10x leverage → $166.67 margin required.",
+    "Leverage via Binance Spot Margin (LEVERAGE in .env, default 10x isolated). Futures not required/available in all regions.",
+    "Max margin per trade capped by MAX_TRADE_SIZE_USD (acts as a hard ceiling — if risk formula would exceed it, position size scales down and actual $ risk drops proportionally).",
+    "Max trades per day capped by MAX_TRADES_PER_DAY in .env",
+    "Daily loss circuit breaker: bot halts trading for the UTC day if cumulative P&L ≤ -MAX_DAILY_LOSS_USD",
     "Do not trade if price is more than 1.5% away from VWAP — overextended",
     "Paper trade first — validate this strategy on your specific asset before going live"
   ],
+
+  "fees_and_costs": {
+    "taker_fee": "0.075% per fill with BNB discount (0.1% without). Round-trip ≈ 0.15% of notional per trade.",
+    "fee_impact": "TP 1.05% − 0.15% fees = 0.90% net. SL 0.30% + 0.15% fees = 0.45% net. True R:R after fees = 2:1. Break-even win rate ~33%.",
+    "borrow_interest": "HOURLY_BORROW_PCT in .env, default 0.0008%/hr (~7% APY) on borrowed portion. Negligible for sub-hour scalps (<$0.01 per trade)."
+  },
 
   "notes": "Scalping strategy — designed for 1m to 5m timeframes. RSI(3) is intentionally fast and sensitive. Do not apply to higher timeframes."
 }

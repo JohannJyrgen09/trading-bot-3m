@@ -1,0 +1,8 @@
+node_modules/
+.git/
+*.log
+safety-check-log.json
+trades.csv
+data/
+logs/
+.env
