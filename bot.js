@@ -1098,12 +1098,9 @@ async function run() {
   // Decision
   console.log("\n── Decision ─────────────────────────────────────────────\n");
 
-  // Direction is set by which side of the Donchian range broke. No breakout → skip.
-  if (!breakoutDir) {
-    console.log("  ⏸ No Donchian breakout this candle. Skipping.");
-    return;
-  }
-  const direction = breakoutDir;
+  // Direction = breakout side, or (if no breakout) the Donchian half we're closer to.
+  // This lets the flow fall through to a BLOCKED Telegram card so the user sees activity.
+  const direction = breakoutDir ?? (price >= donchian.middle ? "BUY" : "SELL");
   const { tp, sl } = calcTPSL(price, direction);
 
   const logEntry = {
