@@ -74,7 +74,7 @@ function checkOnboarding() {
 
 const CONFIG = {
   symbol: process.env.SYMBOL || "BTCUSDT",
-  timeframe: process.env.TIMEFRAME || "4H",
+  timeframe: process.env.TIMEFRAME || "3m",
   portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "10"),
@@ -86,7 +86,7 @@ const CONFIG = {
   // Risk-based sizing: notional = (portfolio × riskPct) / slPct. Single source of truth for TP/SL used everywhere.
   riskPerTradePct: parseFloat(process.env.RISK_PER_TRADE_PCT || "0.01"), // 1% of portfolio per trade
   slPct: parseFloat(process.env.SL_PCT || "0.003"), // 0.3% hard stop — from rules.json
-  tpPct: parseFloat(process.env.TP_PCT || "0.006"), // 0.6% take profit — 2:1 RR
+  tpPct: parseFloat(process.env.TP_PCT || "0.0105"), // 1.05% TP — preserves 2:1 RR after 0.15% round-trip fees
   paperTrading: process.env.PAPER_TRADING !== "false",
   tradeMode: process.env.TRADE_MODE || "spot",
   binance: {
@@ -349,11 +349,11 @@ async function maybeSendReportCard(positions) {
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `Trades: ${closed.length} | ${perf.wins}W / ${perf.losses}L\n` +
     `Win Rate: ${perf.winRate}%\n` +
-    `Total P&L: ${perf.totalPnlUSD >= 0 ? "+" : ""}$${perf.totalPnlUSD.toFixed(3)}\n` +
+    `Total P&amp;L: ${perf.totalPnlUSD >= 0 ? "+" : ""}$${perf.totalPnlUSD.toFixed(3)}\n` +
     `Avg Win: +$${perf.avgWinUSD.toFixed(4)} | Avg Loss: -$${perf.avgLossUSD.toFixed(4)}\n` +
     `Profit Factor: ${perf.profitFactor}\n` +
     `Max Drawdown: -$${perf.maxDrawdownUSD.toFixed(3)}\n` +
-    `Last 10: ${last10W}W/${10 - last10W}L | P&L ${last10Pnl >= 0 ? "+" : ""}$${last10Pnl.toFixed(3)}\n` +
+    `Last 10: ${last10W}W/${10 - last10W}L | P&amp;L ${last10Pnl >= 0 ? "+" : ""}$${last10Pnl.toFixed(3)}\n` +
     `Verdict: ${perf.verdict}\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `💡 <b>Suggestions:</b>\n${tips.join("\n")}`;
@@ -976,7 +976,7 @@ async function run() {
       if (!CONFIG.paperTrading) {
         try {
           // Close at notional so AUTO_REPAY settles the full borrowed position (fallback: margin for legacy)
-          const closeSizeUSD = pos.notionalUSD ?? (pos.tradeSize * (pos.leverage ?? 1));
+          const closeSizeUSD = pos.notionalUSD ?? ((pos.tradeSize ?? pos.sizeUSD ?? 0) * (pos.leverage ?? 1));
           const closeResult = await closeOrder(pos.symbol, pos.direction, closeSizeUSD, price);
           actualExitPrice = closeResult.price || price;
           console.log(`✅ CLOSE ORDER PLACED — ${closeResult.orderId} @ $${actualExitPrice}`);
@@ -1069,7 +1069,14 @@ async function run() {
   // Decision
   console.log("\n── Decision ─────────────────────────────────────────────\n");
 
-  const direction = price > vwap ? "BUY" : "SELL";
+  // Direction requires BOTH VWAP and EMA(8) to agree — avoids conflicting signal trades
+  const bullishSignal = price > vwap && price > ema8;
+  const bearishSignal = price < vwap && price < ema8;
+  if (!bullishSignal && !bearishSignal) {
+    console.log("  ⏸ Mixed signals — VWAP and EMA(8) disagree. Skipping this candle.");
+    return;
+  }
+  const direction = bullishSignal ? "BUY" : "SELL";
   const { tp, sl } = calcTPSL(price, direction);
 
   const logEntry = {
